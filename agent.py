@@ -1,4 +1,5 @@
 import os
+import sqlglot
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
@@ -12,14 +13,14 @@ connection_url = URL.create(
     password=os.getenv("DB_PASSWORD"),
     host=os.getenv("DB_HOST", "localhost"),
     port=os.getenv("DB_PORT", "3306"),
-    database=os.getenv("DB_NAME", "sql_agent_db")
+    database=os.getenv("DB_NAME")
 )
 
 engine = create_engine(connection_url)
 
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1"
+    base_url=os.getenv("BASE_URL")
 )
 
 def get_database_schema():
@@ -41,9 +42,29 @@ def get_database_schema():
     return schema
 
 
-def run_query(sql: str):
-    if not sql.strip().lower().startswith("select"):
+def validate_sql(sql: str) -> str:
+    statements = sqlglot.parse(sql, read="mysql")
+
+    if len(statements) != 1 or statements[0] is None:
+        raise ValueError("Only one SQL statement is allowed.")
+
+    query = statements[0]
+
+    if not isinstance(query, sqlglot.exp.Query):
+        raise ValueError("Only read queries are allowed.")
+
+    if not isinstance(query, sqlglot.exp.Select):
         raise ValueError("Only SELECT queries are allowed.")
+
+    if query.args.get("into") is not None:
+        raise ValueError("SELECT INTO is not allowed.")
+
+    return query.sql(dialect="mysql")
+    
+
+
+def run_query(sql: str):
+    sql = validate_sql(sql)
 
     with engine.connect() as connection:
         result = connection.execute(text(sql))
@@ -54,7 +75,7 @@ def run_query(sql: str):
 
 def generate_sql(question, schema):
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model=os.getenv("MODEL"),
         messages=[
             {
                 "role": "system",
@@ -80,17 +101,22 @@ def generate_sql(question, schema):
     )
 
     sql = response.choices[0].message.content.strip()
+
     return sql
 
 
 if __name__=="__main__":
     schema = get_database_schema()
     question = """
-    Names of the people who has a salary value of more than 50000.    
+    Delete the people named Ali.
     """
     sql = generate_sql(question, schema)
 
-    rows = run_query(sql)
-
-    for row in rows:
-        print(row)
+    try:
+        rows = run_query(sql)
+        
+        for row in rows:
+            print(row)
+    except Exception as e:
+        print(f"An error occured: {e}")
+        print(f"ERROR on SQL statement: {sql}")
